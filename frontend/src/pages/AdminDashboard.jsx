@@ -3,14 +3,15 @@ import { useNavigate } from 'react-router-dom';
 import { Card, TabGroup, TabList, Tab, TabPanels, TabPanel, Text, Metric, Grid } from '@tremor/react';
 import { MapContainer, TileLayer, Marker, Polyline, Popup } from 'react-leaflet';
 import L from 'leaflet';
-import { ArrowLeft, Download, ArrowsClockwise, Bus } from '@phosphor-icons/react';
+import { ArrowLeft, Download, ArrowsClockwise } from '@phosphor-icons/react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
-import { DEFAULT_POLYLINE, DEFAULT_STOPS } from '@/data/transitData';
+import { DEFAULT_STOPS } from '@/data/transitData';
 import SimulatorPanel from './SimulatorPanel';
+import { io } from 'socket.io-client';
 
 const getBusIcon = (status, heading) => {
-  const color = status === 'live' ? '#059669' : status === 'crowd_restored' ? '#d97706' : '#64748b';
+  const color = status === 'live' ? '#059669' : status === 'crowd_restored' ? '#d97706' : status === 'off_route' ? '#dc2626' : '#64748b';
   return L.divIcon({
     className: 'custom-bus-marker',
     html: `<div style="transform: rotate(${heading || 0}deg); background: ${color}; width: 32px; height: 32px; border-radius: 50%; border: 2px solid white; box-shadow: 0 3px 8px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; color: white;">
@@ -31,7 +32,9 @@ const adminDrivers = [
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const [buses, setBuses] = useState([]);
-  const [health, setHealth] = useState({ status: 'ok', activeBuses: 1, uptime: 0 });
+  const [health, setHealth] = useState({ status: 'ok', activeBuses: 0, uptime: 0 });
+  const [allRoutes, setAllRoutes] = useState([]);
+  const [selectedBus, setSelectedBus] = useState(null);
 
   const fetchLiveFleet = async () => {
     try {
@@ -40,21 +43,92 @@ export default function AdminDashboard() {
         fetch('/health').then((r) => r.json())
       ]);
       setBuses(resBuses || []);
-      setHealth(resHealth || { status: 'ok', activeBuses: 1 });
+      setHealth(resHealth || { status: 'ok', activeBuses: 0, uptime: 0 });
     } catch (e) {}
   };
 
   useEffect(() => {
     fetchLiveFleet();
-    const interval = setInterval(fetchLiveFleet, 3000);
-    return () => clearInterval(interval);
-  }, []);
+    
+    // Connect to Socket.io for real-time updates
+    const socket = io(import.meta.env.VITE_BACKEND_URL || '/', {
+      transports: ['websocket', 'polling']
+    });
+
+    socket.on('connect', () => {
+      console.log('[Admin] Socket connected:', socket.id);
+      fetchLiveFleet(); // refresh on reconnect
+    });
+
+    socket.on('bus_update', (bus) => {
+      setBuses((prev) => {
+        const idx = prev.findIndex((b) => b.busId === bus.busId);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = { ...updated[idx], ...bus };
+          return updated;
+        }
+        return [...prev, bus];
+      });
+      setSelectedBus((prev) => (prev && prev.busId === bus.busId) ? { ...prev, ...bus } : prev);
+    });
+
+    socket.on('status_change', (change) => {
+      setBuses((prev) =>
+        prev.map((b) => b.busId === change.busId ? { ...b, status: change.status } : b)
+      );
+      setSelectedBus((prev) => (prev && prev.busId === change.busId) ? { ...prev, status: change.status } : prev);
+      
+      // Show toast alert for status transitions
+      if (change.status === 'scheduled' || change.status === 'inactive') {
+        toast.warning(`⚠️ Bus ${change.busId} went ${change.status}`);
+      } else if (change.status === 'off_route') {
+        toast.error(`🚨 Bus ${change.busId} is OFF ROUTE!`);
+      } else if (change.status === 'live') {
+        toast.success(`✅ Bus ${change.busId} back online!`);
+      }
+    });
+
+    // Fallback: still poll health every 30s
+    const healthInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/health');
+        const data = await res.json();
+        setHealth(data);
+      } catch (e) {}
+    }, 30000);
+    
+    // Fetch all routes for polylines
+    const fetchAllRoutes = async () => {
+      try {
+        const res = await fetch('/api/routes');
+        if (!res.ok) return;
+        const routeSummaries = await res.json();
+        
+        const detailed = await Promise.all(
+          routeSummaries.map(async (r) => {
+            try {
+              const detailRes = await fetch(`/api/routes/${r.id}`);
+              if (detailRes.ok) return await detailRes.json();
+            } catch (e) {}
+            return { ...r, polyline: [] };
+          })
+        );
+        setAllRoutes(detailed);
+      } catch (e) {}
+    };
+    fetchAllRoutes();
+
+    return () => {
+      socket.disconnect();
+      clearInterval(healthInterval);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mogaCenter = [30.825, 75.148];
-  const polylinePositions = DEFAULT_POLYLINE.map((pt) => [pt.lat, pt.lng]);
 
-  const activeBusesCount = buses.filter((b) => b.status === 'live' || b.status === 'crowd_restored').length || 1;
-  const offlineBusesCount = buses.filter((b) => b.status === 'scheduled' || b.status === 'offline').length;
+  const activeBusesCount = buses.filter((b) => b.status === 'live' || b.status === 'crowd_restored').length;
+  const offlineBusesCount = buses.filter((b) => b.status === 'scheduled' || b.status === 'inactive' || b.status === 'offline').length;
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col font-sans sm:px-6 lg:px-8 pb-12">
@@ -103,7 +177,7 @@ export default function AdminDashboard() {
                   <div className="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
                     <h2 className="text-sm font-bold text-gray-800">Live Corridor Map (Moga ⇄ Dagru)</h2>
                     <span className="text-xs font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                      ● Active Fleet: {buses.length || 1}
+                      ● Active Fleet: {buses.length}
                     </span>
                   </div>
                   <div className="h-[420px] w-full bg-gray-100 relative z-0">
@@ -112,8 +186,26 @@ export default function AdminDashboard() {
                         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
                         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                       />
-                      <Polyline positions={polylinePositions} color="#1a56db" weight={5} opacity={0.8} />
+                      
+                      {/* Multi-route polylines */}
+                      {allRoutes.map((route) => (
+                        route.polyline && route.polyline.length > 0 && (
+                          <Polyline
+                            key={route.id}
+                            positions={route.polyline.map((pt) => [pt.lat, pt.lng])}
+                            color={route.color || '#1a56db'}
+                            weight={4}
+                            opacity={0.7}
+                          >
+                            <Popup>
+                              <b>{route.id}: {route.name}</b>
+                              <div>{route.polyline.length} waypoints</div>
+                            </Popup>
+                          </Polyline>
+                        )
+                      ))}
 
+                      {/* Stops rendered only if we don't have multiple routes, or could render DEFAULT_STOPS for now */}
                       {DEFAULT_STOPS.map((s) => (
                         <Marker key={s.id} position={[s.lat, s.lng]}>
                           <Popup>
@@ -123,12 +215,25 @@ export default function AdminDashboard() {
                       ))}
 
                       {buses.map((bus) => (
-                        <Marker key={bus.busId} position={[bus.lat, bus.lng]} icon={getBusIcon(bus.status, bus.heading)}>
+                        <Marker
+                          key={bus.busId}
+                          position={[bus.lat, bus.lng]}
+                          icon={getBusIcon(bus.status, bus.heading)}
+                          eventHandlers={{ click: () => setSelectedBus(bus) }}
+                        >
                           <Popup>
-                            <b>Bus {bus.busId}</b>
-                            <div>Status: {bus.status}</div>
-                            <div>Speed: {bus.speed} km/h</div>
-                            <div>Occupancy: {bus.occupancy_tier || 'seated'}</div>
+                            <div className="text-xs font-sans min-w-[180px]">
+                              <b className="text-sm">🚌 Bus {bus.busId}</b>
+                              <div className="mt-1 space-y-0.5">
+                                <div>Route: <b>{bus.routeId || '—'}</b></div>
+                                <div>Driver: <b>{bus.driverId || 'Unknown'}</b></div>
+                                <div>Status: <b style={{color: bus.status === 'live' ? '#059669' : bus.status === 'off_route' ? '#dc2626' : '#64748b'}}>{bus.status?.toUpperCase()}</b></div>
+                                <div>Speed: <b>{bus.speed || 0} km/h</b></div>
+                                <div>Occupancy: <b>{bus.occupancy_tier || 'unknown'}</b></div>
+                                {bus.startedAt && <div>Trip Duration: <b>{Math.round((Date.now() - bus.startedAt) / 60000)} min</b></div>}
+                                {bus.cross_track_km !== undefined && <div>Off-Corridor: <b>{(bus.cross_track_km * 1000).toFixed(0)}m</b></div>}
+                              </div>
+                            </div>
                           </Popup>
                         </Marker>
                       ))}
@@ -147,9 +252,82 @@ export default function AdminDashboard() {
                   </Card>
                   <Card decoration="top" decorationColor="blue" className="shadow-sm bg-white">
                     <Text className="text-xs text-gray-500 font-bold uppercase">Corridors Monitored</Text>
-                    <Metric className="text-gray-900 font-black mt-1 text-2xl">3 Routes</Metric>
+                    <Metric className="text-gray-900 font-black mt-1 text-2xl">
+                      {allRoutes.length || 3} Routes
+                    </Metric>
                   </Card>
                 </Grid>
+
+                {/* Fleet Status Table */}
+                <Card className="shadow-sm border-gray-200 bg-white mt-4 p-0 overflow-hidden">
+                  <div className="p-4 border-b border-gray-100 bg-gray-50/50">
+                    <h2 className="text-sm font-bold text-gray-800">Fleet Status</h2>
+                  </div>
+                  <div className="divide-y divide-gray-100 max-h-64 overflow-y-auto">
+                    {buses.length === 0 ? (
+                      <div className="p-4 text-center text-gray-400 text-sm">No active buses</div>
+                    ) : (
+                      buses.map((bus) => (
+                        <div
+                          key={bus.busId}
+                          className={`px-4 py-3 flex items-center justify-between cursor-pointer
+                            hover:bg-gray-50 transition-colors
+                            ${selectedBus?.busId === bus.busId ? 'bg-blue-50' : ''}`}
+                          onClick={() => setSelectedBus(bus)}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className={`w-3 h-3 rounded-full ${
+                              bus.status === 'live' ? 'bg-emerald-500' :
+                              bus.status === 'crowd_restored' ? 'bg-amber-500' :
+                              bus.status === 'off_route' ? 'bg-red-500' :
+                              'bg-gray-400'
+                            }`} />
+                            <div>
+                              <div className="font-bold text-sm text-gray-900">{bus.busId}</div>
+                              <div className="text-xs text-gray-500">Route: {bus.routeId || '—'}</div>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs font-bold" style={{
+                              color: bus.status === 'live' ? '#059669' :
+                                     bus.status === 'off_route' ? '#dc2626' : '#64748b'
+                            }}>
+                              {bus.status?.toUpperCase()}
+                            </div>
+                            <div className="text-[10px] text-gray-400">{bus.speed || 0} km/h</div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </Card>
+                
+                {/* Selected Bus Detail Panel */}
+                {selectedBus && (
+                  <Card className="shadow-sm border-gray-200 bg-white p-0 mt-4 overflow-hidden">
+                    <div className="p-4 border-b border-gray-100 bg-gray-50/50 flex justify-between items-center">
+                      <h2 className="text-sm font-bold text-gray-800">
+                        🚌 Bus {selectedBus.busId} — Telemetry
+                      </h2>
+                      <button onClick={() => setSelectedBus(null)} className="text-xs text-gray-400 hover:text-gray-600">✕ Close</button>
+                    </div>
+                    <div className="p-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                      <div><span className="text-gray-500">Route</span><br/><b>{selectedBus.routeId || '—'}</b></div>
+                      <div><span className="text-gray-500">Driver</span><br/><b>{selectedBus.driverId || 'Unknown'}</b></div>
+                      <div><span className="text-gray-500">Status</span><br/><b style={{color: selectedBus.status === 'live' ? '#059669' : selectedBus.status === 'off_route' ? '#dc2626' : '#64748b'}}>{selectedBus.status?.toUpperCase()}</b></div>
+                      <div><span className="text-gray-500">Speed</span><br/><b>{selectedBus.speed || 0} km/h</b></div>
+                      <div><span className="text-gray-500">Heading</span><br/><b>{selectedBus.heading || 0}°</b></div>
+                      <div><span className="text-gray-500">Occupancy</span><br/><b>{selectedBus.occupancy_tier || 'unknown'}</b></div>
+                      <div><span className="text-gray-500">Off-Corridor</span><br/><b>{selectedBus.cross_track_km !== undefined ? `${(selectedBus.cross_track_km * 1000).toFixed(0)}m` : '—'}</b></div>
+                      <div><span className="text-gray-500">Corridor Snapped</span><br/><b>{selectedBus.snapped_to_corridor ? '✅ Yes' : '❌ No'}</b></div>
+                      <div><span className="text-gray-500">GPS Coordinates</span><br/><b>{selectedBus.lat?.toFixed(5) || '—'}, {selectedBus.lng?.toFixed(5) || '—'}</b></div>
+                      <div><span className="text-gray-500">Trip Duration</span><br/><b>{selectedBus.startedAt ? `${Math.round((Date.now() - selectedBus.startedAt) / 60000)} min` : '—'}</b></div>
+                      <div><span className="text-gray-500">BLE Devices</span><br/><b>{selectedBus.ble_count ?? '—'}</b></div>
+                      <div><span className="text-gray-500">Anomaly Counter</span><br/><b>{selectedBus.anomaly_counter || 0}</b></div>
+                    </div>
+                  </Card>
+                )}
+
               </div>
             </TabPanel>
 
@@ -192,7 +370,7 @@ export default function AdminDashboard() {
               </Card>
             </TabPanel>
 
-            {/* Tab 3: GTFS-RT Feeds */}
+            {/* Tab 4: GTFS-RT Feeds */}
             <TabPanel>
               <Card className="bg-white shadow-sm border-gray-200 flex flex-col gap-4">
                 <h3 className="font-bold text-gray-900 text-sm">Open GTFS-Realtime v2.0 Endpoints</h3>
